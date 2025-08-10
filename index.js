@@ -19,6 +19,25 @@ app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/debug-cart", async (req, res) => {
+    const { user_id } = req.query;
+    try {
+      const { data, error } = await supabase
+        .from("cart")
+        .select("*")
+        .eq("user_id", user_id);
+  
+      if (error) {
+        return res.status(500).json({ error: error.message });
+      }
+  
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+
 app.post('/create-checkout-session', async (req, res) => {
   const { ownerType, ownerId, successUrl, cancelUrl } = req.body;
 
