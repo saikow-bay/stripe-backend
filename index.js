@@ -8,9 +8,11 @@ import { supabaseAdmin } from './supabase.js';
 const app = express();
 
 // CORS
-app.use(cors({
-  origin: (process.env.CORS_ORIGIN?.split(',') || ['http://localhost:5173']),
-}));
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN?.split(',') || ['http://localhost:5173'],
+  })
+);
 
 app.use(express.json());
 
@@ -65,10 +67,12 @@ app.post('/create-checkout-session', async (req, res) => {
     // Traer carrito con datos del producto (price = MXN base)
     const base = supabaseAdmin
       .from('cart')
-      .select(`
+      .select(
+        `
         quantity, size,
         product:product_id ( id, name, brand, price, image_urls )
-      )`);
+      `
+      );
 
     const { data: cartItems, error } =
       ownerType === 'user'
@@ -86,8 +90,8 @@ app.post('/create-checkout-session', async (req, res) => {
 
       const unitAmount =
         curr === 'mxn'
-          ? Math.round(priceMXN * 100)                       // MXN → centavos
-          : Math.round((priceMXN / USD_MXN_RATE) * 100);     // a USD con tipo de cambio
+          ? Math.round(priceMXN * 100) // MXN → centavos
+          : Math.round((priceMXN / USD_MXN_RATE) * 100); // a USD con tipo de cambio
 
       return {
         quantity: item.quantity || 1,
@@ -107,7 +111,10 @@ app.post('/create-checkout-session', async (req, res) => {
       mode: 'payment',
       payment_method_types: ['card'],
       line_items,
-      success_url: successUrl || `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      // importante: session_id en el success para confirmarlo después
+      success_url:
+        successUrl ||
+        `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: cancelUrl || `${process.env.FRONTEND_URL}/cart`,
       metadata: { ownerType, ownerId, currency: curr },
       shipping_address_collection: { allowed_countries: ['MX', 'US'] },
@@ -121,34 +128,49 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 /**
- * Confirmar orden SIN webhook:
+ * Confirmar orden SIN webhook (idempotente):
  * - recibe session_id desde /success
  * - verifica con Stripe
- * - crea la order en Supabase
- * - vacía el carrito
+ * - si no existe orden para esa sesión, la crea y vacía el carrito
+ * - si ya existía, responde ok sin duplicar
  */
 app.post('/confirm-order', async (req, res) => {
   try {
     const { session_id } = req.body;
     if (!session_id) return res.status(400).json({ error: 'session_id requerido' });
 
-    // Trae la sesión real de Stripe
-    const session = await stripe.checkout.sessions.retrieve(session_id, { expand: ['line_items'] });
+    // 1) Trae la sesión real de Stripe
+    const session = await stripe.checkout.sessions.retrieve(session_id, {
+      expand: ['line_items'],
+    });
 
-    // Debe estar pagada
+    // 2) Debe estar pagada
     if (session.payment_status !== 'paid') {
-      return res.status(400).json({ error: 'La sesión no está pagada', status: session.payment_status });
+      return res
+        .status(400)
+        .json({ error: 'La sesión no está pagada', status: session.payment_status });
     }
 
     const ownerType = session.metadata?.ownerType; // "user" | "session"
-    const ownerId   = session.metadata?.ownerId;
-    const currency  = (session.metadata?.currency || session.currency || 'mxn').toLowerCase();
+    const ownerId = session.metadata?.ownerId;
+    const currency = (session.metadata?.currency || session.currency || 'mxn').toLowerCase();
 
     if (!ownerType || !ownerId) {
       return res.status(400).json({ error: 'Faltan metadatos de owner en la sesión' });
     }
 
-    // Cargar carrito del dueño
+    // 3) ¿Ya existe una orden con este stripe_session_id? (idempotencia)
+    const existing = await supabaseAdmin
+      .from('orders')
+      .select('id')
+      .eq('stripe_session_id', session.id)
+      .maybeSingle();
+
+    if (existing.data) {
+      return res.json({ ok: true, alreadyProcessed: true, orderId: existing.data.id });
+    }
+
+    // 4) Cargar carrito del dueño
     const base = supabaseAdmin
       .from('cart')
       .select('quantity, size, product:product_id(id, name, brand, price, image_urls)');
@@ -158,39 +180,52 @@ app.post('/confirm-order', async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // Total en MXN base (según DB)
+    // 5) Total en MXN base (según DB)
     const amountMXN = (cartItems || []).reduce(
       (acc, it) => acc + Number(it.product?.price || 0) * (it.quantity || 1),
       0
     );
 
-    // Crear orden
-    const { error: orderErr } = await supabaseAdmin.from('orders').insert([{
-      user_id:   ownerType === 'user'    ? ownerId : null,
-      session_id:ownerType === 'session' ? ownerId : null,
-      stripe_session_id: session.id,
-      currency,
-      amount: amountMXN,
-      status: 'paid',
-      items: (cartItems || []).map(c => ({
-        product_id: c.product?.id,
-        name: c.product?.name,
-        brand: c.product?.brand,
-        price: c.product?.price,
-        quantity: c.quantity,
-        size: c.size,
-        image: c.product?.image_urls?.[0] || null,
-      })),
-    }]);
+    // 6) Crear orden (si hay carrera, el índice único nos protege)
+    const { data: orderData, error: orderErr } = await supabaseAdmin
+      .from('orders')
+      .insert([
+        {
+          user_id: ownerType === 'user' ? ownerId : null,
+          session_id: ownerType === 'session' ? ownerId : null,
+          stripe_session_id: session.id,
+          currency,
+          amount: amountMXN,
+          status: 'paid',
+          items: (cartItems || []).map((c) => ({
+            product_id: c.product?.id,
+            name: c.product?.name,
+            brand: c.product?.brand,
+            price: c.product?.price,
+            quantity: c.quantity,
+            size: c.size,
+            image: c.product?.image_urls?.[0] || null,
+          })),
+        },
+      ])
+      .select('id')
+      .single();
 
-    if (orderErr) return res.status(500).json({ error: orderErr.message });
+    if (orderErr) {
+      // si fue por índice único (otra llamada ganó), responde OK
+      const msg = (orderErr.message || '').toLowerCase();
+      if (msg.includes('duplicate key') || msg.includes('uniq') || msg.includes('unique')) {
+        return res.json({ ok: true, alreadyProcessed: true });
+      }
+      return res.status(500).json({ error: orderErr.message });
+    }
 
-    // Vaciar carrito
+    // 7) Vaciar carrito (solo si acabamos de crear la orden)
     const clear = supabaseAdmin.from('cart').delete();
     if (ownerType === 'user') await clear.eq('user_id', ownerId);
     else await clear.eq('session_id', ownerId);
 
-    return res.json({ ok: true, orderCreated: true });
+    return res.json({ ok: true, orderCreated: true, orderId: orderData.id });
   } catch (e) {
     console.error('confirm-order error:', e);
     return res.status(500).json({ error: 'internal' });
