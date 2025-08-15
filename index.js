@@ -67,12 +67,10 @@ app.post('/create-checkout-session', async (req, res) => {
     // Traer carrito con datos del producto (price = MXN base)
     const base = supabaseAdmin
       .from('cart')
-      .select(
-        `
+      .select(`
         quantity, size,
         product:product_id ( id, name, brand, price, image_urls )
-      `
-      );
+      `);
 
     const { data: cartItems, error } =
       ownerType === 'user'
@@ -118,6 +116,7 @@ app.post('/create-checkout-session', async (req, res) => {
       cancel_url: cancelUrl || `${process.env.FRONTEND_URL}/cart`,
       metadata: { ownerType, ownerId, currency: curr },
       shipping_address_collection: { allowed_countries: ['MX', 'US'] },
+      phone_number_collection: { enabled: true }, // <-- NUEVO: pedir teléfono
     });
 
     res.json({ url: session.url, id: session.id });
@@ -133,13 +132,14 @@ app.post('/create-checkout-session', async (req, res) => {
  * - verifica con Stripe
  * - si no existe orden para esa sesión, la crea y vacía el carrito
  * - si ya existía, responde ok sin duplicar
+ * - guarda customer/shipping/ship_to para saber a dónde enviar
  */
 app.post('/confirm-order', async (req, res) => {
   try {
     const { session_id } = req.body;
     if (!session_id) return res.status(400).json({ error: 'session_id requerido' });
 
-    // 1) Trae la sesión real de Stripe
+    // 1) Trae la sesión real de Stripe (ya incluye customer y shipping)
     const session = await stripe.checkout.sessions.retrieve(session_id, {
       expand: ['line_items'],
     });
@@ -159,7 +159,7 @@ app.post('/confirm-order', async (req, res) => {
       return res.status(400).json({ error: 'Faltan metadatos de owner en la sesión' });
     }
 
-    // 3) ¿Ya existe una orden con este stripe_session_id? (idempotencia)
+    // 3) Idempotencia: ¿ya existe una orden para esta sesión?
     const existing = await supabaseAdmin
       .from('orders')
       .select('id')
@@ -170,7 +170,7 @@ app.post('/confirm-order', async (req, res) => {
       return res.json({ ok: true, alreadyProcessed: true, orderId: existing.data.id });
     }
 
-    // 4) Cargar carrito del dueño
+    // 4) Leer carrito actual del dueño
     const base = supabaseAdmin
       .from('cart')
       .select('quantity, size, product:product_id(id, name, brand, price, image_urls)');
@@ -180,13 +180,27 @@ app.post('/confirm-order', async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // 5) Total en MXN base (según DB)
+    // 5) Total en MXN base
     const amountMXN = (cartItems || []).reduce(
       (acc, it) => acc + Number(it.product?.price || 0) * (it.quantity || 1),
       0
     );
 
-    // 6) Crear orden (si hay carrera, el índice único nos protege)
+    // 6) Armar datos de cliente/envío desde Stripe
+    const customer = session.customer_details || null;  // {name,email,phone,address?}
+    const shipping = session.shipping_details || null;  // {name,address{...}}
+
+    const address = shipping?.address || customer?.address || {};
+    const shipToText = [
+      (shipping?.name || customer?.name || '').trim(),
+      [address.line1, address.line2].filter(Boolean).join(' '),
+      [address.postal_code, address.city].filter(Boolean).join(' '),
+      [address.state, address.country].filter(Boolean).join(' ')
+    ]
+      .filter(Boolean)
+      .join(', ');
+
+    // 7) Crear orden (si hay carrera, el índice único nos protege)
     const { data: orderData, error: orderErr } = await supabaseAdmin
       .from('orders')
       .insert([
@@ -197,6 +211,9 @@ app.post('/confirm-order', async (req, res) => {
           currency,
           amount: amountMXN,
           status: 'paid',
+          customer,            // <-- NUEVO
+          shipping,            // <-- NUEVO
+          ship_to: shipToText, // <-- NUEVO (texto plano)
           items: (cartItems || []).map((c) => ({
             product_id: c.product?.id,
             name: c.product?.name,
@@ -212,7 +229,6 @@ app.post('/confirm-order', async (req, res) => {
       .single();
 
     if (orderErr) {
-      // si fue por índice único (otra llamada ganó), responde OK
       const msg = (orderErr.message || '').toLowerCase();
       if (msg.includes('duplicate key') || msg.includes('uniq') || msg.includes('unique')) {
         return res.json({ ok: true, alreadyProcessed: true });
@@ -220,7 +236,7 @@ app.post('/confirm-order', async (req, res) => {
       return res.status(500).json({ error: orderErr.message });
     }
 
-    // 7) Vaciar carrito (solo si acabamos de crear la orden)
+    // 8) Vaciar carrito (solo si acabamos de crear la orden)
     const clear = supabaseAdmin.from('cart').delete();
     if (ownerType === 'user') await clear.eq('user_id', ownerId);
     else await clear.eq('session_id', ownerId);
